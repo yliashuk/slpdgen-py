@@ -1,0 +1,354 @@
+# slpd_core.py
+"""
+SLPD core types and utilities.
+
+Provides bit-precise integer/float types with serialization support
+for embedded and network protocols.
+"""
+
+import struct
+from typing import Literal, Callable, Tuple, List, Any, Type, TYPE_CHECKING
+
+# =============================================================================
+# INTEGER TYPES
+# =============================================================================
+
+class SlpdInteger(int):
+    _bitsize:int = None 
+    _signed:bool = None
+    _byteorder:str = "little"
+
+    def __new__(cls, value):
+        if cls._bitsize is None or cls._signed is None:
+            raise TypeError("Cannot instantiate base SlpdInteger directly")
+
+        mask = (1 << cls._bitsize) - 1
+        masked = value & mask
+        
+        if cls._signed and (masked & (1 << (cls._bitsize - 1))):
+            masked -= (1 << cls._bitsize)
+        
+        obj = super().__new__(cls, masked)
+        return obj
+    
+    @classmethod
+    def bitsize(cls) -> int:
+        return cls._bitsize
+    
+    def serialize(self, dst: bytearray, bit_offset: int) -> int:
+        required_size = (bit_offset + self._bitsize + 7) // 8
+        if required_size > len(dst):
+            dst.extend([0] * (required_size - len(dst)))
+        
+        length = (self._bitsize + 7) // 8
+        signed = self._signed
+        data = super().to_bytes(length, self._byteorder, signed=signed)
+
+        if bit_offset % 8 == 0:
+            offset = bit_offset // 8
+            dst[offset:offset + len(data)] = data
+        else:
+            bitcpy(dst, bit_offset, data, 0, self._bitsize)
+        
+        return bit_offset + self._bitsize
+
+    @classmethod
+    def deserialize(cls, src: bytes, bit_offset: int = 0) -> Tuple[Any, int]:
+        if len(src) < (bit_offset + cls._bitsize + 7) // 8:
+            raise IndexError("Not enough data for deserialization")
+        
+        length = (cls._bitsize + 7) // 8
+        signed = cls._signed
+        byteorder = cls._byteorder
+                
+        if bit_offset % 8 == 0:
+            offset = bit_offset // 8
+            raw = src[offset:offset + length]
+        else:
+            raw = bytearray()
+            bitcpy(raw, 0, src, bit_offset, cls._bitsize)
+
+        value = int.from_bytes(raw, byteorder, signed=signed)
+        return cls(value), bit_offset + cls._bitsize
+    
+    @classmethod 
+    def deserialize_list(cls, data: bytes, bit_offset: int, count: int
+    ) -> Tuple[List[Any], int]:
+        return deserialize_list(cls.deserialize, data, bit_offset, count)
+
+    @staticmethod
+    def create_type(bitsize: int, signed: bool) -> Type['SlpdInteger']:
+        name = f"{'Int' if signed else 'UInt'}{bitsize}"
+        return type(
+            name, 
+            (SlpdInteger,), 
+            {
+                "_bitsize": bitsize,
+                "_signed": signed,
+                "__new__": SlpdInteger.__new__
+            }
+        )
+    
+# =============================================================================
+# FLOAT TYPES  
+# =============================================================================
+
+class SlpdFloat(float):
+    _bitsize:int = None
+    _precision:str = None
+
+    def __new__(cls, value):
+        if cls._precision is None or cls._bitsize is None:
+            raise TypeError("Cannot instantiate base SlpdFloat directly")
+        obj = super().__new__(cls, value)
+        return obj
+
+    @classmethod
+    def bitsize(cls) -> int:
+        return cls._bitsize
+
+    def serialize(self, dst: bytearray, bit_offset: int) -> int:
+        required_size = (bit_offset + self._bitsize + 7) // 8
+        if required_size > len(dst):
+            dst.extend([0] * (required_size - len(dst)))
+        
+        data = struct.pack(self._precision, self)
+
+        if bit_offset % 8 == 0:
+            offset = bit_offset // 8
+            dst[offset:offset + len(data)] = data
+        else:
+            bitcpy(dst, bit_offset, data, 0, self._bitsize)
+
+        return bit_offset + self._bitsize
+    
+    @classmethod
+    def deserialize(cls, src: bytes, bit_offset: int = 0) -> Tuple[Any, int]:
+        if len(src) < (bit_offset + cls._bitsize + 7) // 8:
+            raise IndexError("Not enough data for deserialization")
+        
+        if bit_offset % 8 == 0:
+            offset = bit_offset // 8
+            raw = src[offset:offset + cls._bitsize // 8]
+        else:
+            raw = bytearray()
+            bitcpy(raw, 0, src, bit_offset, cls._bitsize)
+        
+        value, = struct.unpack(cls._precision, raw)
+        return cls(value), bit_offset + cls._bitsize
+
+    @staticmethod
+    def create_type(precision: Literal['f', 'd']) -> Type['SlpdFloat']:
+        bitsize = 32 if precision == "f" else 64
+        name = f"F{bitsize}"
+        
+        return type(
+            name, 
+            (SlpdFloat,), 
+            {
+                "_bitsize": bitsize,
+                "_precision": precision,
+                "__new__": SlpdFloat.__new__
+            }
+        )
+
+# =============================================================================
+# SERIALIZATION HELPERS
+# =============================================================================
+
+def bitcpy(dst:bytearray, dst_off:int, src:bytes, src_off:int, n:int) -> int:
+    if dst_off % 8 == 0 and src_off % 8 == 0 and n % 8 == 0:
+        dst_start = dst_off // 8
+        src_start = src_off // 8
+        dst[dst_start:dst_start + n // 8] = src[src_start:src_start + n // 8]
+        return n
+    
+    bit = 0
+    num_bits = 0
+    while bit < n:
+        s_off = src_off // 8
+        s_bit_off = src_off % 8
+        s_rest = 8 - s_bit_off
+
+        d_off = dst_off // 8
+        d_bit_off = dst_off % 8
+        d_rest = 8 - d_bit_off
+
+        num_bits = min(s_rest, d_rest, n - bit)
+
+        val = src[s_off] >> s_bit_off
+
+        mask = (1 << num_bits) - 1
+        dst[d_off] &= ~(mask << d_bit_off)
+        dst[d_off] |= (val & mask) << d_bit_off
+
+        bit += num_bits
+        src_off += num_bits
+        dst_off += num_bits
+    return n
+
+def write_bytes(dst: bytearray, bit_offset: int, data: bytes) -> int:
+    required_size = len(data) + (bit_offset + 7) // 8
+    if required_size > len(dst):
+        dst.extend([0] * (required_size - len(dst)))
+    
+    if bit_offset % 8 == 0:
+        offset = bit_offset // 8
+        dst[offset: offset + len(data)] = data
+    else:
+        bitcpy(dst, bit_offset, data, 0, len(data) * 8)
+    
+    return len(data) * 8
+
+def read_bytes(src: bytes, bit_offset: int, n: int) -> Tuple[bytearray, int]:
+    bit_size = n * 8
+    
+    if len(src) < (bit_offset + bit_size + 7) // 8:
+        raise IndexError("Not enough data for deserialization")
+    
+    if bit_offset % 8 == 0:
+        offset = bit_offset // 8
+        return bytearray(src[offset: offset + n]), bit_offset + bit_size
+    else:
+        data = bytearray()
+        bitcpy(data, 0, src, bit_offset, bit_size)
+        return data, bit_offset + bit_size
+
+def serialize_list(
+    serialize_element: Callable[[bytes, int, Any], int],
+    dst: bytearray,
+    bit_offset: int,
+    elements: List[Any],
+    count: int = -1
+) -> int:
+    
+    if count < 0:
+        count = len(elements)
+    elif count > len(elements):
+        raise ValueError(
+            f"count ({count}) exceeds number of elements ({len(elements)})"
+        )
+
+    offset = bit_offset
+    for i in range(count):
+        offset = serialize_element(dst, offset, elements[i])
+        
+    return offset
+
+def deserialize_list(
+    deserialize_element: Callable[[bytes, int], Tuple[Any, int]],
+    data: bytes,
+    bit_offset: int,
+    count: int,
+) -> Tuple[List[Any], int]:
+    result: List[Any] = []
+    offset = bit_offset
+    for _ in range(count):
+        element, offset = deserialize_element(data, offset)
+        result.append(element)
+    return result, offset
+
+# =============================================================================
+# VALIDATION UTILITIES
+# =============================================================================
+
+def check_range(value, min_val=None, max_val=None, field_name=None):
+    if min_val is not None and value < min_val:
+        raise ValueError(
+            f"field '{field_name}' must be >= {min_val} (0x{min_val:X}), got {value} (0x{value:X})"
+        )
+    if max_val is not None and value > max_val:
+        raise ValueError(
+            f"field '{field_name}' must be <= {max_val} (0x{max_val:X}), got {value} (0x{value:X})"
+        )
+    return True
+
+def check_value(value, expected, field_name=None):
+    if value != expected:
+        raise ValueError(
+            f"field '{field_name}' must be 0x{expected:X}, got 0x{value:X}"
+        )
+
+# =============================================================================
+# DYNAMIC TYPE REGISTRATION (Runtime)
+# =============================================================================
+
+__all__: List[str] = [
+    'SlpdInteger', 'SlpdFloat',
+    'bitcpy', 'write_bytes', 'read_bytes',
+    'serialize_list', 'deserialize_list',
+    'check_value', 'check_range',
+]
+
+# Generate u1..u64, i1..i64 integer types
+for bits in range(1, 65):
+    # Unsigned types: u1, u2, ..., u64
+    u_name = f"u{bits}"
+    globals()[u_name] = SlpdInteger.create_type(bits, signed=False)
+    __all__.append(u_name)
+    
+    # Signed types: i1, i2, ..., i64
+    i_name = f"i{bits}"
+    globals()[i_name] = SlpdInteger.create_type(bits, signed=True)
+    __all__.append(i_name)
+
+# Generate f32, f64 float types
+for precision in ('f', 'd'):
+    name = 'f32' if precision == 'f' else 'f64'
+    globals()[name] = SlpdFloat.create_type(precision)
+    __all__.append(name)
+
+# Clean up loop variables from global namespace
+del bits, u_name, i_name, precision, name
+
+# =============================================================================
+# TYPE HINTS FOR IDE (Static Analysis Only)
+# =============================================================================
+
+if TYPE_CHECKING:
+    _IntType = Type[SlpdInteger]
+    
+    # Unsigned 1-64
+    u1: _IntType; u2: _IntType; u3: _IntType; u4: _IntType
+    u5: _IntType; u6: _IntType; u7: _IntType; u8: _IntType
+    u9: _IntType; u10: _IntType; u11: _IntType; u12: _IntType
+    u13: _IntType; u14: _IntType; u15: _IntType; u16: _IntType
+    u17: _IntType; u18: _IntType; u19: _IntType; u20: _IntType
+    u21: _IntType; u22: _IntType; u23: _IntType; u24: _IntType
+    u25: _IntType; u26: _IntType; u27: _IntType; u28: _IntType
+    u29: _IntType; u30: _IntType; u31: _IntType; u32: _IntType
+    u33: _IntType; u34: _IntType; u35: _IntType; u36: _IntType
+    u37: _IntType; u38: _IntType; u39: _IntType; u40: _IntType
+    u41: _IntType; u42: _IntType; u43: _IntType; u44: _IntType
+    u45: _IntType; u46: _IntType; u47: _IntType; u48: _IntType
+    u49: _IntType; u50: _IntType; u51: _IntType; u52: _IntType
+    u53: _IntType; u54: _IntType; u55: _IntType; u56: _IntType
+    u57: _IntType; u58: _IntType; u59: _IntType; u60: _IntType
+    u61: _IntType; u62: _IntType; u63: _IntType; u64: _IntType
+    
+    # Signed 1-64
+    i1: _IntType; i2: _IntType; i3: _IntType; i4: _IntType
+    i5: _IntType; i6: _IntType; i7: _IntType; i8: _IntType
+    i9: _IntType; i10: _IntType; i11: _IntType; i12: _IntType
+    i13: _IntType; i14: _IntType; i15: _IntType; i16: _IntType
+    i17: _IntType; i18: _IntType; i19: _IntType; i20: _IntType
+    i21: _IntType; i22: _IntType; i23: _IntType; i24: _IntType
+    i25: _IntType; i26: _IntType; i27: _IntType; i28: _IntType
+    i29: _IntType; i30: _IntType; i31: _IntType; i32: _IntType
+    i33: _IntType; i34: _IntType; i35: _IntType; i36: _IntType
+    i37: _IntType; i38: _IntType; i39: _IntType; i40: _IntType
+    i41: _IntType; i42: _IntType; i43: _IntType; i44: _IntType
+    i45: _IntType; i46: _IntType; i47: _IntType; i48: _IntType
+    i49: _IntType; i50: _IntType; i51: _IntType; i52: _IntType
+    i53: _IntType; i54: _IntType; i55: _IntType; i56: _IntType
+    i57: _IntType; i58: _IntType; i59: _IntType; i60: _IntType
+    i61: _IntType; i62: _IntType; i63: _IntType; i64: _IntType
+    
+    del _IntType
+
+    # Float types
+    _FloatType = Type[SlpdFloat]
+    f32: _FloatType 
+    f64: _FloatType
+
+    del _FloatType

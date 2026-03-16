@@ -1,0 +1,151 @@
+{# ============================== MACROSES ============================== #}
+
+{%- macro m_read_bits_fun() -%}
+local function read_bits(buffer, bit_offset, n)
+    local result = 0
+
+    local write_pos = 0
+    local bit_pos = bit_offset
+    local bit = 0
+    while(bit < n) do
+        local byte_pos = math.floor(bit_pos / 8)
+        local read_pos = bit_pos % 8
+        local align_rem = math.abs(0 - read_pos)
+        local num_bits = math.min(n - bit, 32 - align_rem)
+        local num_bytes = math.ceil((num_bits + align_rem)/ 8)
+
+        local value = buffer:range(byte_pos, num_bytes):le_uint()
+        local bits = bit32.extract(value, read_pos, num_bits)
+        result = bit32.bor(bit32.lshift(bits, write_pos), result)
+		
+        bit = bit + num_bits
+        write_pos = write_pos + num_bits
+        bit_pos = bit_pos + num_bits
+    end
+
+    return result
+end
+{%- endmacro -%}
+
+{%- macro m_parse_simple(field) -%}
+    {%- set protofield = 'protocol.fields.' ~ field.owner ~ '_' ~ field.name -%}
+    {%- set in_bytes = ceil(sizeof(field) / 8) -%}
+    {%- if is_always_aligned(field) and sizeof(field) % 8 == 0 and not is_length(field) %}
+    tree:add_le({{protofield}}, buffer(readPos / 8, {{in_bytes}}))
+    {%- else %}
+    local {{field.name}} = read_bits(buffer, readPos, {{sizeof(field)}})
+    tree:add_le({{protofield}}, buffer(readPos / 8, {{in_bytes}}), {{field.name}})
+    {%- endif %}
+    readPos = readPos+{{sizeof(field)}}
+{%- endmacro -%}
+
+{%- macro m_parse_structural(field) %}
+    local subtree = tree:add_le("{{field.name}}")
+    readPos = Parse_{{field.type}}(buffer, readPos, subtree)
+{%- endmacro -%}
+
+{%- macro m_parse_simple_array(field) -%}
+    {%- set protofield = 'protocol.fields.' ~ field.owner ~ '_' ~ field.name -%}
+    {%- set in_bytes = ceil(sizeof(field.type) / 8) -%}
+    {%- if is_bytes_aligned(field) %}
+    tree:add_le({{protofield}}, buffer(readPos / 8, {{length(field)}}))
+    readPos = readPos+{{sizeof(field)}}
+    {%- else -%}
+        {%- set val = 'UInt64(' ~ field.name ~ ')'if sizeof(field.type) > 32 else field.name %}
+    tree_{{field.name}} = tree:add(buffer(readPos / 8, {{in_bytes}}), "{{field.name}}" .. '[' .. tostring({{length(field)}}) .. ']')
+    for i = 0, {{length(field)}} - 1, 1 do
+        local subtree = tree_{{field.name}}:add_le("{{field.name}}[" .. (i) .. ']')
+        local {{field.name}} = read_bits(buffer, readPos, {{sizeof(field.type)}})
+        local label = "{{field.name}}[" .. (i) .. "]: 0x" .. string.format("%0{{ceil(sizeof(field.type) / 4)}}X", {{field.name}})
+        subtree:add({{protofield}}, buffer(readPos / 8, {{in_bytes}}), {{val}}, label)
+        readPos = readPos+{{sizeof(field.type)}}
+    end
+    {%- endif -%}
+{%- endmacro -%}
+
+{%- macro m_parse_structural_array(field) -%}
+    tree_{{field.name}} = tree:add("{{field.name}}" .. '[' .. tostring({{length(field)}}) .. ']')
+    for i = 0, {{length(field)}} - 1, 1 do
+        local subtree = tree_{{field.name}}:add("{{field.name}}[" .. (i) .. ']')
+        readPos = Parse_{{field.type}}(buffer, readPos, subtree)
+    end
+
+{%- endmacro -%}
+
+{# ============================== MAIN TEMPLATE ============================== #}
+{%- for enum in enumerables %}
+local enum_{{enum.name}} = 
+{ 
+{%- for field in enum.fields %}
+    [{{field.value}}] = "{{field.name}}",
+{%- endfor %}
+}
+
+local function val_enum_{{enum.name}}(key)
+    for v, k in pairs(enum_{{enum.name}}) do
+        if v == key then return k end
+    end
+end
+{% endfor %}
+local protocol = Proto ("slpd_{{proto_name}}", "{{proto_name}} protocol")
+{% for msg in structurals %} 
+-- {{msg.name}}
+{% for field in msg.fields if not is_structural(field) -%}
+    {%- set field_type = lua_type(field) -%}
+    {%- set field_name = '"' ~ 'slpd_' ~ proto_name ~ '.' ~ msg.name ~ '.' ~ field.name ~ '"' -%}
+    {%- set display_name = '"' ~ field.name ~ '"' -%}
+    {%- set base = lua_base(field) -%}
+    {%- set enum_table = 'enum_' ~ field.type if is_enumerable(field) else None -%}
+    {%- set args = [field_name, display_name, base, enum_table] -%}
+protocol.fields.{{msg.name}}_{{field.name}} = ProtoField.{{field_type}}({{args|reject('none')|join(', ')}})
+{% endfor -%}
+{% endfor %}
+{{m_read_bits_fun()}}
+{% for msg in structurals %} 
+local function Parse_{{msg.name}}(buffer, readPos, tree)
+    {% for field in msg.fields %}
+        {%- if is_builtin(field) or is_enumerable(field) -%}
+            {{m_parse_simple(field)}}
+        {%- elif is_array(field) and is_builtin(field.type) -%}
+            {{m_parse_simple_array(field)}}
+        {%- elif is_structural(field) -%}
+            {{m_parse_structural(field)}}
+        {%- elif is_array(field) and is_structural(field.type) -%}
+            {{m_parse_structural_array(field)}}
+        {% endif %}
+    {%- endfor %}
+    return readPos
+end
+{% endfor %}
+function protocol.dissector(buffer, pinfo, tree)
+{%- for field in header.fields -%}
+    {%- if field.initValue is not none %}
+    if read_bits(buffer, {{offset(field)}}, {{sizeof(field)}}) ~= {{field.initValue}} then return end
+    {%- endif %}
+{%- endfor %}
+    pinfo.cols.protocol = "{{proto_name}}"
+    subtree = tree:add_le(protocol, buffer)
+    local readPos = Parse_{{header.name}}(buffer, 0, subtree)
+
+{%- for field in header.fields -%}
+    {%- if field.name == "dataLen" or field.type in [code.name, type.name] %}
+    local {{field.name}} = read_bits(buffer, {{offset(field)}}, {{sizeof(field)}})
+    {%- endif -%}
+{%- endfor %}
+
+    if dataLen ~= 0 then
+        tr = subtree:add(buffer(readPos / 8), "Data")
+{%- for rdm in rdms -%}
+    {%- set typeval = enumerable_val(type, rdm.type) -%}
+    {%- set codeval = enumerable_val(code, rdm.command) %}
+        if code == {{codeval}} and type == {{typeval}} then
+            Parse_{{rdm.packet}}(buffer, readPos, tr)
+        end
+{%- endfor %}
+    end
+    pinfo.cols.info = pinfo.src_port.." → "..pinfo.dst_port.." Len="..buffer:len().." "..
+    val_enum_{{type.name}}(type).." "..val_enum_{{code.name}}(code)
+end
+
+local udp_table = DissectorTable.get("udp.port")
+udp_table:add({{proto_port}}, protocol)
