@@ -1,0 +1,42 @@
+from enum import IntEnum
+from dataclasses import dataclass
+from typing import Protocol, Callable, List
+from slpd_core import *
+
+{% for enum in enumerables -%}
+class {{to_type_format(enum.name)}}(IntEnum):
+    {% for field in enum.fields -%}
+    {{to_const_format(field.name)}} = {{field.value}}
+    {% endfor %}
+{% endfor -%}
+
+{% for struct in structurals -%}
+@dataclass
+class {{to_type_format(to_type_name(struct.name))}}:
+    {% for field in struct.fields -%}
+        {%- set type = field.type if is_builtin(field.type) else to_type_format(field.type) -%}
+        {%- set hint = 'List[' ~ type ~']' if is_array(field) else type -%}
+        {%- if is_length(field) -%} # {% endif -%}
+    {{to_field_format(field.name)}}: {{hint}}
+        {%- if is_array(field) %} # {{length(field)}}{%- endif %}
+    {% endfor %}
+{% endfor -%}
+
+class {{to_type_format(proto_name)}}(Protocol):
+    # callbacks
+{%- for rdm in rdms -%}
+    {%- set packet = to_type_format(to_type_name(rdm.packet)) -%}
+    {%- set callback = to_field_format('_'.join([rdm.type, rdm.command, 'received'])) %}
+    {{callback}}: Callable[[Header, {{packet}}], None]
+{%- endfor %}
+    send: Callable[[bytes], None]
+    
+    # senders
+{%- for rdm in rdms -%}
+    {%- set msg = "msg: " + to_type_format(to_type_name(rdm.packet)) -%}
+    {%- set sender = to_func_format('_'.join(['send', rdm.type, rdm.command])) %}
+    def {{sender}}({{(["self", msg] + remote_args())|join(', ')}}): ...
+{%- endfor %}
+
+    def init({{(["self"] + local_args())|join(', ')}}): ...
+    def parse(self, src: bytes) -> bool: ...

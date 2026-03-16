@@ -1,0 +1,213 @@
+{#- ============================== MACROSES ============================== -#}
+
+{%- macro m_serdes_check_value(field, fieldname) -%}
+    {%- if field.initValue != none %}
+        check_value({{fieldname}}, {{'0x%X' % field.initValue}}, '{{field.name}}')
+    {%- endif -%}
+{%- endmacro -%}
+
+{%- macro m_serdes_check_range(field, fieldname) -%}
+    {%- if field.toVal != none or field.fromVal != none %}
+        check_range({{fieldname}}, {{field.fromVal}}, {{field.toVal}}, '{{field.name}}')
+    {%- endif -%}
+{%- endmacro -%}
+
+{%- macro m_serialize_field(field, fieldname) -%}
+    {%- set fieldtype = to_field_format(field.type) -%}
+    {%- set ser_struct = classname ~ to_func_format('._serialize_' ~ fieldtype) -%}
+    {%- set ser_builtin = 'u' ~ sizeof(field.type) ~ to_func_format('.serialize') -%}
+    {%- set ser_func = ser_builtin if is_builtin(field.type) else ser_struct -%}
+        
+    {%- if is_structural(field) %}
+        offset = {{ser_func}}(dst, offset, {{fieldname}})
+        {%- elif is_enumerable(field) or is_bool(field) %}
+        offset = u{{sizeof(field)}}({{fieldname}}).serialize(dst, offset)
+        {%- elif is_array(field) and sizeof(field.type) == 8 and not is_bool(field) %}
+        offset = write_bytes(dst, offset, {{fieldname}})
+        {%- elif is_array(field) %}
+        offset = serialize_list({{ser_func}}, dst, offset, {{fieldname}})
+        {%- elif is_length(field) -%}
+            {%- set listname = 'src.' ~ to_field_format(field_with_length(field).name) %}
+        offset = {{field.type}}(len({{listname}})).serialize(dst, offset)
+        {%- elif is_builtin(field) %}
+        offset = {{fieldname}}.serialize(dst, offset)
+        {%- endif -%}
+{%- endmacro -%}
+
+{%- macro m_deserialize_field(field, varname) -%}
+    {%- set fieldtype = to_type_name(field.type) -%}
+    {%- set des_struct = classname ~ to_func_format('._deserialize_' ~ fieldtype) -%}
+    {%- set des_builtin = 'u' ~ sizeof(field.type) ~ to_func_format('.deserialize') -%}
+    {%- set des_func = des_builtin if is_builtin(field.type) else des_struct -%}
+    
+    {%- if is_structural(field) %}
+        {{varname}}, offset = {{des_func}}(src, offset)
+        {%- elif is_enumerable(field) or is_bool(field) %}
+        {{varname}}, offset = u{{sizeof(field)}}.deserialize(src, offset)
+        {%- elif is_array(field) and sizeof(field.type) == 8 and not is_bool(field) %}
+        {{varname}}, offset = read_bytes(src, offset, {{length(field)}})
+        {%- elif is_array(field) %}
+        {{varname}}, offset = deserialize_list({{des_func}}, src, offset, {{length(field)}})
+        {%- elif is_builtin(field) %}
+        {{varname}}, offset = {{fieldtype}}.deserialize(src, offset)
+        {%- endif -%}
+{%- endmacro -%}
+
+{% macro m_return_deserialized_dataclass(fields, classname)%}
+        return {{classname}}(
+    {%- for field in fields -%}
+        {%- if is_enumerable(field) %}
+            {{to_type_format(field.type)}}({{to_field_format(field.name)}})
+        {%- elif is_bool(field) %}
+            bool({{to_field_format(field.name)}})
+        {%- elif not is_length(field) %}
+            {{to_field_format(field.name)}}
+        {%- endif %}
+        {%- if not loop.last and not is_length(field) %}, {% endif %}
+    {%- endfor %}
+        )
+{% endmacro %}
+
+{%- macro m_make_send_header(rdm) -%}
+    header = {{to_type_format(header.name)}}(
+    {%- for field in header.fields -%}
+        {%- set name = to_field_format(field.name) -%}
+        {%- set typename = field.type if is_builtin(field) else to_type_format(field.type) %}
+            {%- if field.initValue != none %}
+            {{name}} = {{typename}}({{'0x%X' % field.initValue}})
+            {%- elif field in local_fields() %}
+            {{name}} = self._{{name}}
+            {%- elif field in remote_fields() %}
+            {{name}} = {{name}}
+            {%- elif field.type == code.name %}
+            {{name}} = {{typename}}.{{to_const_format(rdm.command)}}
+            {%- elif field.type == type.name %}
+            {{name}} = {{typename}}.{{to_const_format(rdm.type)}}
+            {%- elif is_data_len(field) %}
+            {{name}} = len(data)
+            {%- else %}
+            {{name}} = 0
+            {%- endif %}
+            {%- if not loop.last %}, {% endif %}
+    {%- endfor %}
+        )
+{%- endmacro -%}
+
+{#- ============================== MAIN TEMPLATE ============================== -#}
+
+from typing import Optional, Tuple
+from slpd_core import *
+from {{proto_name}} import *
+
+DATA = True
+EMPTY = False
+{% set classname = to_type_format(proto_name ~ 'Impl') %}
+class {{classname}}({{to_type_format(proto_name)}}):
+    
+    def __init__(self):
+{%- for rdm in rdms -%}
+    {%- set callback = to_field_format('_'.join([rdm.type, rdm.command, 'received'])) %}
+        self.{{callback}} = None
+{%- endfor %}
+        self.send = None
+
+        {%- set codename = to_type_format(code.name) -%}
+        {%- set typename = to_type_format(type.name) %}
+
+        self._deserializers = {
+{%- for rdm in rdms -%}
+    {%- set palyload = "DATA" if rdm.packet is not none else "EMPTY" -%}
+    {%- set fun_name = to_func_format('deserialize_' ~ to_type_name(rdm.packet)) %}
+            ({{typename}}.{{rdm.type}}, {{codename}}.{{rdm.command}}): self._{{fun_name}},
+{%- endfor %}
+        }
+        
+        self._callbacks = {
+{%- for rdm in rdms -%}
+    {%- set callback = to_field_format('_'.join([rdm.type, rdm.command, 'received'])) -%}
+    {%- set payload = "DATA" if rdm.packet is not none else "EMPTY" %}
+            ({{typename}}.{{rdm.type}}, {{codename}}.{{rdm.command}}, {{payload}}): '{{callback}}',
+{%- endfor %}
+        }
+{% for rdm in rdms -%}
+    {%- set msg = "msg: " + to_type_format(to_type_name(rdm.packet)) -%}
+    {%- set sender = to_func_format('_'.join(['send', rdm.type, rdm.command])) %}
+    def {{sender}}({{(["self", msg] + remote_args())|join(', ')}}) -> None:
+    {%- set method = '_serialize_' ~ to_func_format(to_type_name(rdm.packet)) %}
+        data = bytearray()
+        self.{{method}}(data, 0, msg)
+
+        {{m_make_send_header(rdm)}}
+
+        packet = bytearray()
+        offset = self._serialize_{{to_func_format(header.name)}}(packet, 0, header)
+        write_bytes(packet, offset, data)
+        
+        if self.send is not None:
+            self.send(packet)
+{% endfor %}
+    def init({{(["self"] + local_args())|join(', ')}}):
+{%- for field in local_fields() -%}
+    {%- set name = to_field_format(field.name) %}
+        self._{{name}} = {{field.type}}({{name}})
+{%- endfor %}
+
+    def parse(self, src: bytes) -> bool:
+        try:
+            result = self._deserialize_header(src, 0)
+
+            if result is None: 
+                return False
+
+            header, offset = result
+
+            has_payload = header.dataLen > 0
+            name = self._callbacks.get((header.type, header.code, has_payload))
+            callback = getattr(self, name, None)
+
+            if callback is None:
+                return False
+
+            if has_payload:
+                deserializer = self._deserializers.get((header.type, header.code))
+
+                if deserializer is None:
+                    return False
+
+                result = deserializer(src, offset)
+
+                if result is None:
+                    return False
+
+                msg, _ = result
+                callback(header, msg)
+            else:
+                callback(header)
+
+            return True
+        except (IndexError, ValueError):
+            return False
+
+{% for str in structurals -%}
+    {%- set hint = to_type_format(to_type_name(str.name)) -%}
+    {%- set method = to_func_format(to_type_name(str.name)) %} 
+    @staticmethod
+    def _serialize_{{method}}(dst: bytearray, offset: int, src: {{hint}}) -> int:
+    {%- for field in str.fields -%}
+        {%- set fieldname = 'src.' ~ to_field_format(field.name) -%}
+        {{- m_serdes_check_value(field, fieldname) }}
+        {{- m_serdes_check_range(field, fieldname) }}
+        {{- m_serialize_field(field, fieldname) }}
+    {%- endfor %}
+        return offset
+
+    @staticmethod
+    def _deserialize_{{method}}(src: bytes, offset: int) -> Optional[Tuple[{{hint}}, int]]:
+    {%- for field in str.fields -%}
+        {%- set varname = to_field_format(field.name) -%}
+        {{- m_deserialize_field(field, varname) }}
+        {{- m_serdes_check_value(field, varname) }}
+        {{- m_serdes_check_range(field, varname) }}
+    {%- endfor %}
+        {{m_return_deserialized_dataclass(str.fields, hint)}}
+{%- endfor %}
