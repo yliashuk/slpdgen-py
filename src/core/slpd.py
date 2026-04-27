@@ -97,6 +97,9 @@ class SlpdProto:
         return SlpdProto._get_typename(target) == 'bool'
 
     def is_enumerable(self, target):
+        if SlpdProto.is_array(target):
+            return False
+
         name = SlpdProto._get_typename(target)
         if name is None: 
             return False

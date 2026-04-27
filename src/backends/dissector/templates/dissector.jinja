@@ -52,22 +52,30 @@ end
     readPos = readPos+{{sizeof(field)}}
     {%- else -%}
         {%- set val = 'UInt64(' ~ field.name ~ ')'if sizeof(field.type) > 32 else field.name %}
-    tree_{{field.name}} = tree:add(buffer(readPos / 8, {{in_bytes}}), "{{field.name}}" .. '[' .. tostring({{length(field)}}) .. ']')
-    for i = 0, {{length(field)}} - 1, 1 do
-        local subtree = tree_{{field.name}}:add_le("{{field.name}}[" .. (i) .. ']')
+    tree_{{field.name}} = tree:add(buffer(readPos / 8, {{length(field)}}), "{{field.name}}" .. '[' .. tostring({{length(field)}}) .. ']')
+    
+    local i_{{field.name}} = 0
+    while i_{{field.name}} < {{length(field)}} do
         local {{field.name}} = read_bits(buffer, readPos, {{sizeof(field.type)}})
-        local label = "{{field.name}}[" .. (i) .. "]: 0x" .. string.format("%0{{ceil(sizeof(field.type) / 4)}}X", {{field.name}})
-        subtree:add({{protofield}}, buffer(readPos / 8, {{in_bytes}}), {{val}}, label)
+        
+        {%- set hex_val = '"0x" .. string.format("%0{}X", {})'.format(ceil(sizeof(field.type) / 4), field.name) %}
+        {%- set enum_val = 'val_enum_{}({}) .. " (" .. {} .. ")"'.format(field.type, field.name, hex_val) %}
+        
+        local label = "{{field.name}}[" .. (i_{{field.name}}) .. "]: " .. {{enum_val if is_enumerable(field.type) else hex_val}}
+        tree_{{field.name}}:add({{protofield}}, buffer(readPos / 8, {{in_bytes}}), {{val}}, label)
         readPos = readPos+{{sizeof(field.type)}}
+        i_{{field.name}} = i_{{field.name}} + 1
     end
     {%- endif -%}
 {%- endmacro -%}
 
 {%- macro m_parse_structural_array(field) -%}
     tree_{{field.name}} = tree:add("{{field.name}}" .. '[' .. tostring({{length(field)}}) .. ']')
-    for i = 0, {{length(field)}} - 1, 1 do
-        local subtree = tree_{{field.name}}:add("{{field.name}}[" .. (i) .. ']')
+    local i_{{field.name}} = 0
+    while i_{{field.name}} < {{length(field)}} do
+        local subtree = tree_{{field.name}}:add("{{field.name}}[" .. (i_{{field.name}}) .. ']')
         readPos = Parse_{{field.type}}(buffer, readPos, subtree)
+        i_{{field.name}} = i_{{field.name}} + 1
     end
 
 {%- endmacro -%}
@@ -106,7 +114,7 @@ local function Parse_{{msg.name}}(buffer, readPos, tree)
     {% for field in msg.fields %}
         {%- if is_builtin(field) or is_enumerable(field) -%}
             {{m_parse_simple(field)}}
-        {%- elif is_array(field) and is_builtin(field.type) -%}
+        {%- elif is_array(field) and (is_builtin(field.type) or is_enumerable(field.type)) -%}
             {{m_parse_simple_array(field)}}
         {%- elif is_structural(field) -%}
             {{m_parse_structural(field)}}
